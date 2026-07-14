@@ -363,6 +363,7 @@ namespace gamescope
         virtual bool SupportsTearing() const = 0;
 
         virtual bool UsesVulkanSwapchain() const = 0;
+        virtual bool IsOutputSampledByCompositor() const { return false; }
         virtual bool IsSessionBased() const = 0;
 
         virtual bool SupportsExplicitSync() const = 0;

@@ -141,6 +141,7 @@ public:
 			bExportable = false;
 			bOutputImage = false;
 			bColorAttachment = false;
+			bSampledByCompositor = false;
 			imageType = VK_IMAGE_TYPE_2D;
 		}
 
@@ -154,6 +155,7 @@ public:
 		bool bExportable : 1;
 		bool bOutputImage : 1;
 		bool bColorAttachment : 1;
+		bool bSampledByCompositor : 1;
 		VkImageType imageType;
 	};
 

@@ -125,6 +125,34 @@ uint32_t g_uCompositeDebug = 0u;
 gamescope::ConVar<uint32_t> cv_composite_debug{ "composite_debug", 0, "Debug composition flags" };
 
 static std::map< VkFormat, std::map< uint64_t, VkDrmFormatModifierPropertiesEXT > > DRMModifierProps = {};
+
+struct ModifierFormatPropKey
+{
+	VkFormat format;
+	VkImageType type;
+	uint64_t modifier;
+	VkImageUsageFlags usage;
+	VkImageCreateFlags flags;
+
+	bool operator<( const ModifierFormatPropKey &other ) const
+	{
+		if ( format != other.format ) return format < other.format;
+		if ( type != other.type ) return type < other.type;
+		if ( modifier != other.modifier ) return modifier < other.modifier;
+		if ( usage != other.usage ) return usage < other.usage;
+		return flags < other.flags;
+	}
+};
+
+struct ModifierFormatProperties
+{
+	bool bSupported = false;
+	VkExtent3D maxExtent = {};
+	VkExternalMemoryFeatureFlags externalMemoryFeatures = 0;
+};
+
+static std::map< ModifierFormatPropKey, ModifierFormatProperties > s_ModifierFormatPropsCache;
+
 static std::unordered_map<uint32_t, std::vector<uint64_t>> s_SampledModifierFormats = {};
 static struct wlr_drm_format_set sampledShmFormats = {};
 static struct wlr_drm_format_set sampledDRMFormats = {};
@@ -1973,7 +2001,7 @@ static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
 	return true;
 }
 
-static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps)
+static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps, VkImageFormatProperties2 *pImageProps = nullptr )
 {
 	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierFormatInfo = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
@@ -2005,12 +2033,15 @@ static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t m
 		formatList.pNext = std::exchange(imageFormatInfo.pNext, &formatList);
 	}
 
-	VkImageFormatProperties2 imageProps = {
+	VkImageFormatProperties2 localImageProps = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
 		.pNext = externalFormatProps,
 	};
+	VkImageFormatProperties2 *pOutImageProps = pImageProps ? pImageProps : &localImageProps;
+	pOutImageProps->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+	pOutImageProps->pNext = externalFormatProps;
 
-	return g_device.vk.GetPhysicalDeviceImageFormatProperties2(g_device.physDev(), &imageFormatInfo, &imageProps);
+	return g_device.vk.GetPhysicalDeviceImageFormatProperties2(g_device.physDev(), &imageFormatInfo, pOutImageProps);
 }
 
 static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
@@ -2169,43 +2200,92 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 		uint64_t linear = DRM_FORMAT_MOD_LINEAR;
 
-		const uint64_t *possibleModifiers;
-		size_t numPossibleModifiers;
+		const auto tryModifier = [&]( uint64_t modifier ) -> bool
+		{
+			ModifierFormatPropKey key
+			{
+				imageInfo.format,
+				imageInfo.imageType,
+				modifier,
+				imageInfo.usage,
+				imageInfo.flags,
+			};
+
+			auto iter = s_ModifierFormatPropsCache.find( key );
+			if ( iter == s_ModifierFormatPropsCache.end() )
+			{
+				VkExternalImageFormatProperties externalFormatProps = {
+					.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+				};
+				VkImageFormatProperties2 imageProps = {};
+
+				VkResult propRes = getModifierProps( &imageInfo, modifier, &externalFormatProps, &imageProps );
+				if ( propRes == VK_ERROR_FORMAT_NOT_SUPPORTED )
+				{
+					s_ModifierFormatPropsCache[key] = { false };
+					return false;
+				}
+				else if ( propRes != VK_SUCCESS )
+				{
+					vk_errorf( propRes, "getModifierProps failed" );
+					return false;
+				}
+
+				ModifierFormatProperties props;
+				props.bSupported = true;
+				props.maxExtent = imageProps.imageFormatProperties.maxExtent;
+				props.externalMemoryFeatures = externalFormatProps.externalMemoryProperties.externalMemoryFeatures;
+				iter = s_ModifierFormatPropsCache.emplace( key, props ).first;
+			}
+
+			if ( !iter->second.bSupported )
+				return false;
+
+			if ( !( iter->second.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) )
+				return false;
+
+			if ( flags.bSampledByCompositor )
+			{
+				if ( iter->second.maxExtent.width < width || iter->second.maxExtent.height < height )
+				{
+					vk_log.infof( "Modifier 0x%016lx cannot sample %ux%u (max %ux%u), skipping",
+						modifier, width, height, iter->second.maxExtent.width, iter->second.maxExtent.height );
+					return false;
+				}
+			}
+
+			return true;
+		};
+
 		if ( flags.bLinear )
 		{
-			possibleModifiers = &linear;
-			numPossibleModifiers = 1;
+			if ( tryModifier( linear ) )
+				modifiers.push_back( linear );
 		}
 		else
 		{
-			std::span<const uint64_t> modifiers = GetBackend()->GetSupportedModifiers( drmFormat );
-			assert( !modifiers.empty() );
-			possibleModifiers = modifiers.data();
-			numPossibleModifiers = modifiers.size();
-		}
+			std::span<const uint64_t> advertisedModifiers = GetBackend()->GetSupportedModifiers( drmFormat );
+			assert( !advertisedModifiers.empty() );
 
-		for ( size_t i = 0; i < numPossibleModifiers; i++ )
-		{
-			uint64_t modifier = possibleModifiers[i];
-
-			VkExternalImageFormatProperties externalFormatProps = {
-				.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
-			};
-			res = getModifierProps( &imageInfo, modifier, &externalFormatProps );
-			if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED )
-				continue;
-			else if ( res != VK_SUCCESS ) {
-				vk_errorf( res, "getModifierProps failed" );
-				return false;
+			for ( uint64_t modifier : advertisedModifiers )
+			{
+				if ( tryModifier( modifier ) )
+					modifiers.push_back( modifier );
 			}
 
-			if ( !( externalFormatProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) )
-				continue;
-
-			modifiers.push_back( modifier );
+			if ( modifiers.empty() && flags.bSampledByCompositor )
+			{
+				vk_log.warnf( "No advertised modifier supports %ux%u for sampled compositor output, trying DRM_FORMAT_MOD_LINEAR", width, height );
+				if ( tryModifier( linear ) )
+					modifiers.push_back( linear );
+			}
 		}
 
-		assert( modifiers.size() > 0 );
+		if ( modifiers.empty() )
+		{
+			vk_log.errorf( "No usable modifier found for %ux%u flippable image", width, height );
+			return false;
+		}
 
 		modifierListInfo = {
 			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
@@ -3287,6 +3367,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	outputImageflags.bTransferSrc = true; // for screenshots
 	outputImageflags.bSampled = true; // for pipewire blits
 	outputImageflags.bOutputImage = true;
+	outputImageflags.bSampledByCompositor = GetBackend()->IsOutputSampledByCompositor();
 
 	pOutput->outputImages.resize(3); // extra image for partial composition.
 	pOutput->outputImagesPartialOverlay.resize(3);
